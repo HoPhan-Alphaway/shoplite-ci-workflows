@@ -18,10 +18,10 @@ on:
         default: dev
       gitops-repo:
         type: string
-        default: HoPhan-Alphaway/shoplite-gitops
+        default: shoplite-lab/shoplite-gitops
     secrets:
       GITOPS_DEPLOY_KEY:
-        description: SSH private key of a write deploy key on the gitops repo
+        description: SSH private key of a write deploy key on the gitops repo (organization secret)
         required: true
 
 permissions:
