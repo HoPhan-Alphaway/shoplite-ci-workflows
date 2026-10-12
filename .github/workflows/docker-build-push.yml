@@ -1,0 +1,110 @@
+# Reusable: build the repo's Dockerfile, scan it with Trivy, push to GHCR.
+#
+# Image: ghcr.io/<owner>/<repo>, tags: <full git sha> (+ "main" on the default branch).
+# On pull requests the image is built and scanned but never pushed.
+name: docker-build-push
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: Push to GHCR after a clean scan
+        type: boolean
+        default: false
+      trivy-severity:
+        type: string
+        default: CRITICAL
+    outputs:
+      image:
+        value: ${{ jobs.image.outputs.image }}
+      tag:
+        value: ${{ jobs.image.outputs.tag }}
+      digest:
+        value: ${{ jobs.image.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push to GHCR with GITHUB_TOKEN, no PAT needed
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      tag: ${{ steps.vars.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compute image name and tag
+        id: vars
+        run: |
+          # Registry paths must be lowercase; the GitHub owner name is not.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.vars.outputs.tag }}
+            type=raw,value=main,enable={{is_default_branch}}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # 1) Build into the local Docker daemon so Trivy can scan it before anything is published.
+      - name: Build (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.vars.outputs.image }}:scan
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Pinned to the commit of an immutable release: trivy-action tags were hijacked in March 2026.
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}:scan
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2) Same build again (fully cached) + push, with SBOM and provenance attestations.
+      - name: Build and push
+        id: push
+        if: inputs.push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          sbom: true
+          provenance: mode=max
+
+      - name: Summary
+        if: inputs.push
+        run: |
+          {
+            echo "### Image pushed"
+            echo "\`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}\`"
+            echo
+            echo "digest: \`${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
